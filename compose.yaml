@@ -1,0 +1,22 @@
+name: solo23-printlab
+services:
+  app:
+    build: .
+    image: solo23-printlab:1.0
+    ports:
+      - "127.0.0.1:18923:18923"
+    volumes:
+      - printlab-data:/data
+    environment:
+      PRINTLAB_DATA_DIR: /data
+      PORT: "18923"
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18923/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+volumes:
+  printlab-data:
