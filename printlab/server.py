@@ -10,6 +10,7 @@ from flask import Flask, Response, jsonify, render_template, request, send_file
 from werkzeug.exceptions import HTTPException
 
 from . import measurements, operations, plates, profiles, reports, targets, workflows
+from . import calibration_workflows
 from .pixels import MAX_FILE_BYTES, gray_image, integer, json_safe, png_bytes, read_image, tiff_bytes
 from .storage import Store
 
@@ -73,7 +74,7 @@ def create_app(data_root=None):
     def catalog():
         target_list = targets.target_catalog()
         target_list += [{'id': 'step_wedge', 'name': '四版灰阶靶标', 'description': '带可测量色块位置的阶梯样张'}, {'id': 'control_strip', 'name': '实色控制条', 'description': 'CMYK实色、半调及叠印色块'}]
-        return response({'operations': operations.operation_catalog(), 'targets': target_list, 'profile_defaults': profiles.default_profiles(), 'limits': {'maximum_pixels': 4_194_304, 'maximum_dimension': 4096, 'upload_bytes': MAX_FILE_BYTES, 'processing_concurrency': 1}, 'limitations': ['图像数值工作流不执行ICC转换', '油墨与纸张模拟为近似演示', '合成素材不是实际印机测量', '目前套准仅支持平移、人工仿射与四角平面校正']})
+        return response({'operations': operations.operation_catalog(), 'targets': target_list, 'profile_defaults': profiles.default_profiles(), 'limits': {'maximum_pixels': 4_194_304, 'maximum_dimension': 4096, 'upload_bytes': MAX_FILE_BYTES, 'processing_concurrency': 1}, 'limitations': ['图像数值工作流不执行ICC转换', '油墨与纸张模拟为近似演示', '合成素材不是实际印机测量', '目前套准仅支持平移、人工仿射与四角平面校正', '实测扫描校准仅适用于同曝光/白平衡/灯光设置；外推像素不标记为可靠读数']})
 
     @app.get('/api/jobs')
     def jobs_list():
@@ -212,6 +213,61 @@ def create_app(data_root=None):
     @app.get('/api/jobs/<job_id>/events')
     def events(job_id):
         return response({'events': store.events(job_id, request.args.get('limit', 100))})
+
+    # ------------------------------------------------------------------
+    # 实测扫描校准
+    # ------------------------------------------------------------------
+    @app.post('/api/jobs/<job_id>/calibrations')
+    def calibration_create(job_id):
+        return response(calibration_workflows.create_session(store, job_id, payload()), 201)
+
+    @app.get('/api/jobs/<job_id>/calibrations')
+    def calibration_list(job_id):
+        only_confirmed = request.args.get('status') == 'confirmed'
+        records = store.list_calibrations(job_id)
+        if only_confirmed:
+            records = [row for row in records if row['status'] == 'confirmed']
+        return response({'calibrations': records})
+
+    @app.get('/api/calibrations/<calibration_id>')
+    def calibration_get(calibration_id):
+        return response(store.get_calibration(calibration_id))
+
+    @app.post('/api/calibrations/<calibration_id>/cards')
+    def calibration_card_add(calibration_id):
+        return response(calibration_workflows.add_card(store, calibration_id, payload()), 201)
+
+    @app.post('/api/calibrations/<calibration_id>/patches')
+    def calibration_patch_add(calibration_id):
+        return response(calibration_workflows.add_patch(store, calibration_id, payload()), 201)
+
+    @app.post('/api/calibrations/<calibration_id>/patches/csv')
+    def calibration_patch_csv(calibration_id):
+        return response(calibration_workflows.import_patches_csv(store, calibration_id, payload()), 201)
+
+    @app.patch('/api/calibrations/<calibration_id>/patches')
+    def calibration_patch_update(calibration_id):
+        return response(calibration_workflows.update_patch(store, calibration_id, payload()))
+
+    @app.post('/api/calibrations/<calibration_id>/patches/remove')
+    def calibration_patch_remove(calibration_id):
+        return response(calibration_workflows.remove_patch(store, calibration_id, payload()))
+
+    @app.post('/api/calibrations/<calibration_id>/evidence')
+    def calibration_evidence(calibration_id):
+        with processing_lock:
+            result = calibration_workflows.build_evidence(store, calibration_id, payload())
+        return response(result)
+
+    @app.post('/api/calibrations/<calibration_id>/confirm')
+    def calibration_confirm(calibration_id):
+        with processing_lock:
+            result = calibration_workflows.confirm(store, calibration_id, payload())
+        return response(result, 201)
+
+    @app.post('/api/calibrations/<calibration_id>/revise')
+    def calibration_revise(calibration_id):
+        return response(calibration_workflows.revise(store, calibration_id, payload()), 201)
 
     @app.get('/api/operations/<operation_id>')
     def operation_get(operation_id):

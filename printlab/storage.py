@@ -122,6 +122,16 @@ class Store:
                     job_id TEXT, event TEXT NOT NULL,
                     payload TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS calibrations (
+                    id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id),
+                    name TEXT NOT NULL, status TEXT NOT NULL,
+                    session TEXT NOT NULL, evidence TEXT NOT NULL,
+                    confirmed_model TEXT, decision TEXT,
+                    revision_of TEXT REFERENCES calibrations(id),
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL, confirmed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS calibrations_job ON calibrations(job_id, created_at);
             ''')
 
     def serialize(self, value):
@@ -192,6 +202,7 @@ class Store:
             result['assets'] = [self.asset_row(item) for item in connection.execute('SELECT * FROM assets WHERE job_id=? ORDER BY created_at,id', (job_id,))]
             result['operations'] = [self.operation_row(item) for item in connection.execute('SELECT * FROM operations WHERE job_id=? ORDER BY created_at DESC,id', (job_id,))]
             result['profiles'] = [self.profile_row(item) for item in connection.execute('SELECT * FROM profiles WHERE job_id=? ORDER BY created_at', (job_id,))]
+            result['calibrations'] = [self.calibration_row(item) for item in connection.execute('SELECT * FROM calibrations WHERE job_id=? ORDER BY created_at,id', (job_id,))]
             result['notes'] = [dict(item) for item in connection.execute('SELECT * FROM notes WHERE job_id=? ORDER BY created_at DESC', (job_id,))]
         return result
 
@@ -460,20 +471,105 @@ class Store:
             results.append(item)
         return results
 
+    def calibration_row(self, row):
+        result = dict(row)
+        result['session'] = json.loads(result['session'])
+        result['evidence'] = json.loads(result['evidence'])
+        result['confirmed_model'] = json.loads(result['confirmed_model']) if result['confirmed_model'] else None
+        result['decision'] = json.loads(result['decision']) if result['decision'] else None
+        return result
+
+    def save_calibration(self, job_id, name, session, evidence, status='draft',
+                         confirmed_model=None, decision=None, revision_of=None, revision=1):
+        title = safe_label(name)
+        if status not in ('draft', 'confirmed', 'superseded'):
+            raise ValueError('校准状态只支持 draft、confirmed、superseded')
+        calibration_id = identifier('cal')
+        now = utc_now()
+        with self.transaction() as connection:
+            self.require_job(connection, job_id)
+            if revision_of:
+                previous = connection.execute('SELECT * FROM calibrations WHERE id=? AND job_id=?', (revision_of, job_id)).fetchone()
+                if previous is None:
+                    raise KeyError('被修订的校准不存在')
+            connection.execute(
+                'INSERT INTO calibrations(id,job_id,name,status,session,evidence,confirmed_model,'
+                'decision,revision_of,revision,created_at,confirmed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                (calibration_id, job_id, title, status, self.serialize(session), self.serialize(evidence),
+                 self.serialize(confirmed_model) if confirmed_model is not None else None,
+                 self.serialize(decision) if decision is not None else None,
+                 revision_of, int(revision), now, now if status == 'confirmed' else None))
+            self.touch(connection, job_id)
+            self.event(connection, job_id, 'calibration_saved',
+                       {'calibration_id': calibration_id, 'status': status, 'revision_of': revision_of})
+        return self.get_calibration(calibration_id)
+
+    def update_calibration_session(self, calibration_id, session, evidence):
+        with self.transaction() as connection:
+            row = connection.execute('SELECT * FROM calibrations WHERE id=?', (calibration_id,)).fetchone()
+            if row is None:
+                raise KeyError('校准不存在')
+            if row['status'] != 'draft':
+                raise ValueError('已确认的校准不可修改；请基于它创建修订版')
+            connection.execute('UPDATE calibrations SET session=?, evidence=? WHERE id=?',
+                               (self.serialize(session), self.serialize(evidence), calibration_id))
+            self.touch(connection, row['job_id'])
+            self.event(connection, row['job_id'], 'calibration_updated', {'calibration_id': calibration_id})
+        return self.get_calibration(calibration_id)
+
+    def confirm_calibration(self, calibration_id, model, decision):
+        if not isinstance(model, dict) or 'kind' not in model or 'response_coefficients' not in model:
+            raise ValueError('确认内容必须包含完整模型快照')
+        with self.transaction() as connection:
+            row = connection.execute('SELECT * FROM calibrations WHERE id=?', (calibration_id,)).fetchone()
+            if row is None:
+                raise KeyError('校准不存在')
+            if row['status'] != 'draft':
+                raise ValueError('该校准已经确认，不能重复确认')
+            now = utc_now()
+            connection.execute(
+                'UPDATE calibrations SET status=?, confirmed_model=?, decision=?, confirmed_at=? WHERE id=?',
+                ('confirmed', self.serialize(model), self.serialize(decision), now, calibration_id))
+            # 同作业内其它已确认档案标记为被取代，但保留全部证据不删除。
+            connection.execute(
+                "UPDATE calibrations SET status='superseded' WHERE job_id=? AND status='confirmed' AND id<>?",
+                (row['job_id'], calibration_id))
+            self.touch(connection, row['job_id'])
+            self.event(connection, row['job_id'], 'calibration_confirmed',
+                       {'calibration_id': calibration_id, 'model_kind': model.get('kind')})
+        return self.get_calibration(calibration_id)
+
+    def get_calibration(self, calibration_id):
+        with self.connect() as connection:
+            row = connection.execute('SELECT * FROM calibrations WHERE id=?', (calibration_id,)).fetchone()
+            if row is None:
+                raise KeyError('校准不存在')
+            return self.calibration_row(row)
+
+    def list_calibrations(self, job_id):
+        with self.connect() as connection:
+            self.require_job(connection, job_id)
+            rows = connection.execute('SELECT * FROM calibrations WHERE job_id=? ORDER BY created_at,id', (job_id,)).fetchall()
+        return [self.calibration_row(row) for row in rows]
+
     def health(self):
         with self.connect() as connection:
             jobs = connection.execute('SELECT COUNT(*) FROM jobs').fetchone()[0]
             assets = connection.execute('SELECT COUNT(*) FROM assets').fetchone()[0]
             operations = connection.execute('SELECT COUNT(*) FROM operations').fetchone()[0]
+            calibrations = connection.execute('SELECT COUNT(*) FROM calibrations').fetchone()[0]
             integrity = connection.execute('PRAGMA quick_check').fetchone()[0]
-        return {'ok': integrity == 'ok', 'jobs': jobs, 'assets': assets, 'operations': operations, 'database': 'sqlite-wal', 'persistent_root': str(self.root)}
+        return {'ok': integrity == 'ok', 'jobs': jobs, 'assets': assets, 'operations': operations,
+                'calibrations': calibrations, 'database': 'sqlite-wal', 'persistent_root': str(self.root)}
 
     def export_manifest(self, job_id):
         job = self.get_job(job_id)
         job['events'] = self.events(job_id, 1000)
         job['exported_at'] = utc_now()
         job['format'] = 'printlab-job-v1'
-        job['limitations'] = ['RGB数值工作流，不代替ICC印刷认证', 'CMYK模型为教学与小型栅格打样近似', '图像不超过419万像素']
+        job['limitations'] = ['RGB数值工作流，不代替ICC印刷认证', 'CMYK模型为教学与小型栅格打样近似', '图像不超过419万像素',
+                              '实测校准的可靠范围按像素标记；不支持的校准像素不视为可靠读数',
+                              '已确认校准为不可变快照，修订参考只产生新版本，不改变旧结果']
         return job
 
     def export_archive(self, job_id, include_arrays=False):
@@ -494,4 +590,6 @@ class Store:
                         archive.writestr('arrays/' + asset['id'] + '.npy', self.read_blob(row['blob']))
             for operation in manifest['operations']:
                 archive.writestr('reports/' + operation['id'] + '.json', self.serialize(operation))
+            for calibration in manifest.get('calibrations', []):
+                archive.writestr('calibrations/' + calibration['id'] + '.json', self.serialize(calibration))
         return stream.getvalue()

@@ -128,16 +128,40 @@ def output_inventory(job):
 
 def quality_observations(job):
     observations = []
-    numeric_keys = {'rms_rgb_error', 'before_rmse', 'after_rmse', 'phase_response', 'rms_landmark_error', 'max_landmark_error', 'clipped_fraction', 'mean_coverage_percent', 'total_mean_percent', 'mean_density', 'max_density', 'mean_delta_e', 'rms_error', 'defect_fraction', 'narrow_skeleton_pixels'}
+    numeric_keys = {'rms_rgb_error', 'before_rmse', 'after_rmse', 'phase_response', 'rms_landmark_error', 'max_landmark_error', 'clipped_fraction', 'mean_coverage_percent', 'total_mean_percent', 'mean_density', 'max_density', 'mean_delta_e', 'rms_error', 'defect_fraction', 'narrow_skeleton_pixels', 'supported_fraction'}
     for operation in job.get('operations', []):
         summary = operation.get('summary', {})
         for key, value in summary.items():
             if key in numeric_keys and isinstance(value, (int, float)):
                 observations.append({'operation_id': operation['id'], 'operation': operation['operation'], 'metric': key, 'value': value, 'source_id': operation['source_id'], 'created_at': operation['created_at']})
-        limitation = summary.get('limitation') or summary.get('limitations')
+        limitation = summary.get('limitation') or summary.get('limitations') or summary.get('reliability_rule') or summary.get('scope')
         if limitation:
             observations.append({'operation_id': operation['id'], 'operation': operation['operation'], 'metric': 'limitation', 'value': limitation, 'source_id': operation['source_id'], 'created_at': operation['created_at']})
     return observations
+
+
+def calibration_summaries(job):
+    """已确认/草稿校准档案的不可变摘要，供作业报告追溯模型选择与可靠范围。"""
+    rows = []
+    for calibration in job.get('calibrations', []):
+        evidence = calibration.get('evidence') or {}
+        recommendation = evidence.get('recommendation') if isinstance(evidence, dict) else None
+        model = calibration.get('confirmed_model')
+        rows.append({
+            'calibration_id': calibration['id'],
+            'name': calibration['name'],
+            'status': calibration['status'],
+            'revision': calibration['revision'],
+            'revision_of': calibration.get('revision_of'),
+            'model_kind': model.get('kind') if model else None,
+            'workspace': (model or {}).get('workspace'),
+            'recommendation': recommendation.get('recommended') if recommendation else None,
+            'scans': len(calibration['session'].get('scans', [])),
+            'created_at': calibration['created_at'],
+            'confirmed_at': calibration.get('confirmed_at'),
+            'rule': '已确认档案为不可变快照；修订参考只产生新版本，旧结果与可靠范围不变',
+        })
+    return rows
 
 
 def job_report(store, job_id):
@@ -151,9 +175,11 @@ def job_report(store, job_id):
         'lineage': lineage_graph(job),
         'observations': quality_observations(job),
         'profiles': job.get('profiles', []),
+        'calibrations': calibration_summaries(job),
         'notes': job.get('notes', []),
         'operations': job.get('operations', []),
-        'limitations': ['合成演示素材均显式标注。', 'RGB近似油墨模型不代替ICC色彩管理或印刷认证。', '默认所有图像操作生成新结果，保留原图和参数。', '几何套准目前仅提供全局平移、人工仿射和四角平面校正。'],
+        'limitations': ['合成演示素材均显式标注。', 'RGB近似油墨模型不代替ICC色彩管理或印刷认证。', '默认所有图像操作生成新结果，保留原图和参数。', '几何套准目前仅提供全局平移、人工仿射和四角平面校正。',
+                        '实测校准仅适用于同曝光/白平衡/灯光设置；位置、亮度或颜色超出训练覆盖的像素只标记为外推，不计入可靠质量读数。'],
     }
     return json_safe(report)
 
@@ -200,6 +226,9 @@ def html_report(report):
     pieces.append(html_table(report['inventory']))
     pieces.append('<h2>质量观测</h2>')
     pieces.append(html_table(report['observations']))
+    if report.get('calibrations'):
+        pieces.append('<h2>实测扫描校准档案</h2>')
+        pieces.append(html_table(report['calibrations']))
     for operation in reversed(report['operations']):
         pieces.append('<section><h2>' + html.escape(operation['operation']) + '</h2>')
         pieces.append('<small>' + html.escape(operation['created_at']) + ' · ' + html.escape(operation['id']) + '</small>')

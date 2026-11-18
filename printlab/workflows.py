@@ -179,4 +179,15 @@ def validate_job_links(store, job_id):
         reference = operation.get('reference_id')
         if reference and reference not in ids:
             problems.append({'operation_id': operation['id'], 'problem': 'missing_reference'})
-    return {'job_id': job_id, 'ok': not problems, 'checked_arrays': checked_arrays, 'checked_operations': len(operation_ids), 'problems': problems}
+    calibration_ids = {calibration['id'] for calibration in job.get('calibrations', [])}
+    for calibration in job.get('calibrations', []):
+        revision_of = calibration.get('revision_of')
+        if revision_of and revision_of not in calibration_ids:
+            problems.append({'calibration_id': calibration['id'], 'problem': 'missing_revision_parent'})
+        scan_ids = {scan['scan_id'] for scan in calibration['session'].get('scans', [])}
+        if not scan_ids or not scan_ids.issubset(ids):
+            problems.append({'calibration_id': calibration['id'], 'problem': 'missing_calibration_scan'})
+        if calibration['status'] == 'confirmed' and not calibration.get('confirmed_model'):
+            problems.append({'calibration_id': calibration['id'], 'problem': 'confirmed_without_model'})
+    return {'job_id': job_id, 'ok': not problems, 'checked_arrays': checked_arrays, 'checked_operations': len(operation_ids),
+            'checked_calibrations': len(calibration_ids), 'problems': problems}

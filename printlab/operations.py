@@ -83,6 +83,8 @@ SPECIAL = {
     'measure_bars': ('印机与油墨', '测量实色控制条', 'rgb'),
     'screen_coverage': ('网屏制作', '网版覆盖率对照', 'pair_cmyk'),
     'contact_sheet': ('印张排布', '作业图像联系表', 'rgb'),
+    'scan_calibration': ('扫描整理', '应用实测扫描校准', 'rgb'),
+    'calibrated_quality': ('扫描整理', '校准后可靠质量测量', 'rgb'),
 }
 
 
@@ -155,6 +157,25 @@ def execute_special(store, name, asset, array, reference_asset, reference_array,
     source = as_rgb(array)
     if name == 'region_report':
         return regions.region_summary(source, asset['regions'])
+    if name == 'scan_calibration':
+        from . import calibration_workflows
+        calibration_id = parameters.pop('calibration_id', None)
+        if not calibration_id:
+            raise ValueError('请选择已确认的实测校准档案')
+        strength = parameters.pop('strength', 1.0)
+        if parameters:
+            raise ValueError('不支持的参数：' + '、'.join(sorted(parameters)))
+        return calibration_workflows.apply_scan_calibration(store, asset, calibration_id, strength)
+    if name == 'calibrated_quality':
+        from . import calibration_workflows
+        calibration_id = parameters.pop('calibration_id', None)
+        if not calibration_id:
+            raise ValueError('请选择已确认的实测校准档案')
+        white_rgb = parameters.pop('white_rgb', (1, 1, 1))
+        channel = parameters.pop('channel', 'K')
+        if parameters:
+            raise ValueError('不支持的参数：' + '、'.join(sorted(parameters)))
+        return calibration_workflows.calibrated_quality(store, asset, calibration_id, white_rgb, channel)
     if name == 'screen_coverage':
         if reference_array is None:
             raise ValueError('请选择原始连续调分色作为参考')
