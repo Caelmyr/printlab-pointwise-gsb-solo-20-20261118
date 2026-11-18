@@ -15,6 +15,14 @@ DEFAULT_INKS = [
 ]
 DEFAULT_PAPER = {'rgb': [0.97, 0.96, 0.92], 'gsm': 120, 'name': '暖白演示纸', 'width_mm': 210, 'height_mm': 297}
 DEFAULT_SCREEN = {'method': 'am', 'lpi': 50, 'dpi': 300, 'angles': [15, 75, 0, 45], 'dot_shape': 'round', 'seed': 42}
+DEFAULT_SPOT_INKS = [
+    {'name': '青', 'rgb': [0.05, 0.66, 0.8], 'density': 1.1, 'cost_per_kg': 120},
+    {'name': '品红', 'rgb': [0.85, 0.1, 0.42], 'density': 1.15, 'cost_per_kg': 130},
+    {'name': '黄', 'rgb': [0.98, 0.85, 0.05], 'density': 1.0, 'cost_per_kg': 110},
+    {'name': '黑', 'rgb': [0.1, 0.1, 0.11], 'density': 1.3, 'cost_per_kg': 90},
+    {'name': '专橙', 'rgb': [0.95, 0.42, 0.08], 'density': 1.1, 'cost_per_kg': 160},
+    {'name': '专绿', 'rgb': [0.1, 0.55, 0.3], 'density': 1.1, 'cost_per_kg': 160},
+]
 
 
 def text_name(value, fallback):
@@ -103,19 +111,22 @@ def validate_tolerances(payload):
 
 
 def validate_profile(kind, payload):
-    validators = {'curves': validate_curves, 'inks': validate_inks, 'paper': validate_paper, 'screen': validate_screen, 'tolerances': validate_tolerances}
+    from .spotcolor import validate_spot_inks
+    validators = {'curves': validate_curves, 'inks': validate_inks, 'paper': validate_paper, 'screen': validate_screen, 'tolerances': validate_tolerances, 'spot_inks': validate_spot_inks}
     if kind not in validators:
         raise ValueError('配置种类不支持')
     return validators[kind](payload)
 
 
 def default_profiles():
+    from .spotcolor import validate_spot_inks
     return [
         {'kind': 'curves', 'name': '线性墨量曲线', 'payload': validate_curves({'curves': copy.deepcopy(DEFAULT_CURVES)})},
         {'kind': 'inks', 'name': '演示CMYK油墨', 'payload': validate_inks({'inks': copy.deepcopy(DEFAULT_INKS), 'paper_rgb': [0.97, 0.96, 0.92]})},
         {'kind': 'paper', 'name': '暖白演示纸', 'payload': validate_paper(copy.deepcopy(DEFAULT_PAPER))},
         {'kind': 'screen', 'name': '50线演示网屏', 'payload': validate_screen(copy.deepcopy(DEFAULT_SCREEN))},
         {'kind': 'tolerances', 'name': '基础质量警戒', 'payload': validate_tolerances({})},
+        {'kind': 'spot_inks', 'name': '演示专色油墨库', 'payload': validate_spot_inks({'inks': copy.deepcopy(DEFAULT_SPOT_INKS), 'paper_rgb': [0.97, 0.96, 0.92]})},
     ]
 
 

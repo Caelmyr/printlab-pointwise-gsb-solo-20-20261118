@@ -117,6 +117,13 @@ class Store:
                     asset_id TEXT REFERENCES assets(id), text TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS spot_batches (
+                    id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id),
+                    name TEXT NOT NULL, status TEXT NOT NULL,
+                    spec TEXT NOT NULL, plans TEXT NOT NULL, confirmed TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS spot_batches_job ON spot_batches(job_id, created_at);
                 CREATE TABLE IF NOT EXISTS events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     job_id TEXT, event TEXT NOT NULL,
@@ -248,6 +255,10 @@ class Store:
         if not path.is_file():
             raise RuntimeError('图像内容丢失')
         return path.read_bytes()
+
+    def read_array(self, name):
+        payload = self.read_blob(name)
+        return np.asarray(np.load(io.BytesIO(payload), allow_pickle=False), dtype=np.float32)
 
     def asset_record(self, job_id, name, kind, array, metadata=None, parent_id=None, operation_id=None, preview=None):
         values = np.asarray(array, dtype=np.float32)
@@ -418,6 +429,56 @@ class Store:
                 raise KeyError('配置不存在')
         return self.profile_row(row)
 
+    def spot_batch_row(self, row):
+        result = dict(row)
+        result['spec'] = json.loads(result['spec'])
+        result['plans'] = json.loads(result['plans'])
+        result['confirmed'] = json.loads(result['confirmed']) if result['confirmed'] else None
+        return result
+
+    def spot_batch_summary(self, row):
+        item = self.spot_batch_row(row)
+        plans = [{'plan_id': plan['plan_id'], 'title': plan['title'], 'qualified': plan['qualified'], 'inks': [ink['name'] for ink in plan['inks']], 'key_region_max_ratio': plan['key_region_max_ratio'], 'totals': plan['totals']} for plan in item['plans'].get('plans', [])]
+        return {'id': item['id'], 'job_id': item['job_id'], 'name': item['name'], 'status': item['status'], 'created_at': item['created_at'], 'updated_at': item['updated_at'], 'image_count': len(item['spec'].get('images', [])), 'ink_count': len(item['spec'].get('inks', [])), 'plans': plans, 'identical': item['plans'].get('identical'), 'confirmed_plan_id': (item['confirmed'] or {}).get('plan_id')}
+
+    def create_spot_batch(self, job_id, name, spec, plans, status):
+        title = safe_label(name)
+        if status not in ('compared', 'unfeasible'):
+            raise ValueError('批次状态不支持')
+        batch_id = identifier('spot')
+        now = utc_now()
+        with self.transaction() as connection:
+            self.require_job(connection, job_id)
+            connection.execute('INSERT INTO spot_batches VALUES(?,?,?,?,?,?,?,?,?)', (batch_id, job_id, title, status, self.serialize(spec), self.serialize(plans), None, now, now))
+            self.touch(connection, job_id)
+            self.event(connection, job_id, 'spot_batch_created', {'batch_id': batch_id, 'status': status})
+        return self.get_spot_batch(batch_id)
+
+    def list_spot_batches(self, job_id):
+        with self.connect() as connection:
+            self.require_job(connection, job_id)
+            rows = connection.execute('SELECT * FROM spot_batches WHERE job_id=? ORDER BY created_at,id', (job_id,)).fetchall()
+        return [self.spot_batch_summary(row) for row in rows]
+
+    def get_spot_batch(self, batch_id):
+        with self.connect() as connection:
+            row = connection.execute('SELECT * FROM spot_batches WHERE id=?', (batch_id,)).fetchone()
+            if row is None:
+                raise KeyError('专色批次不存在')
+        return self.spot_batch_row(row)
+
+    def confirm_spot_batch(self, batch_id, confirmed):
+        with self.transaction() as connection:
+            row = connection.execute('SELECT * FROM spot_batches WHERE id=?', (batch_id,)).fetchone()
+            if row is None:
+                raise KeyError('专色批次不存在')
+            if row['status'] == 'confirmed':
+                raise ValueError('该批次已确认开版，配方与结果已锁定')
+            connection.execute("UPDATE spot_batches SET status='confirmed', confirmed=?, updated_at=? WHERE id=?", (self.serialize(confirmed), utc_now(), batch_id))
+            self.touch(connection, row['job_id'])
+            self.event(connection, row['job_id'], 'spot_batch_confirmed', {'batch_id': batch_id, 'plan_id': confirmed.get('plan_id')})
+        return self.get_spot_batch(batch_id)
+
     def add_note(self, job_id, text, asset_id=None):
         body = str(text).strip()
         if not body or len(body) > 4000:
@@ -471,6 +532,7 @@ class Store:
     def export_manifest(self, job_id):
         job = self.get_job(job_id)
         job['events'] = self.events(job_id, 1000)
+        job['spot_batches'] = [self.get_spot_batch(item['id']) for item in self.list_spot_batches(job_id)]
         job['exported_at'] = utc_now()
         job['format'] = 'printlab-job-v1'
         job['limitations'] = ['RGB数值工作流，不代替ICC印刷认证', 'CMYK模型为教学与小型栅格打样近似', '图像不超过419万像素']

@@ -9,7 +9,7 @@ import numpy as np
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from werkzeug.exceptions import HTTPException
 
-from . import measurements, operations, plates, profiles, reports, targets, workflows
+from . import measurements, operations, plates, profiles, reports, spotcolor, targets, workflows
 from .pixels import MAX_FILE_BYTES, gray_image, integer, json_safe, png_bytes, read_image, tiff_bytes
 from .storage import Store
 
@@ -73,7 +73,7 @@ def create_app(data_root=None):
     def catalog():
         target_list = targets.target_catalog()
         target_list += [{'id': 'step_wedge', 'name': '四版灰阶靶标', 'description': '带可测量色块位置的阶梯样张'}, {'id': 'control_strip', 'name': '实色控制条', 'description': 'CMYK实色、半调及叠印色块'}]
-        return response({'operations': operations.operation_catalog(), 'targets': target_list, 'profile_defaults': profiles.default_profiles(), 'limits': {'maximum_pixels': 4_194_304, 'maximum_dimension': 4096, 'upload_bytes': MAX_FILE_BYTES, 'processing_concurrency': 1}, 'limitations': ['图像数值工作流不执行ICC转换', '油墨与纸张模拟为近似演示', '合成素材不是实际印机测量', '目前套准仅支持平移、人工仿射与四角平面校正']})
+        return response({'operations': operations.operation_catalog(), 'targets': target_list, 'profile_defaults': profiles.default_profiles(), 'limits': {'maximum_pixels': 4_194_304, 'maximum_dimension': 4096, 'upload_bytes': MAX_FILE_BYTES, 'processing_concurrency': 1}, 'limitations': ['图像数值工作流不执行ICC转换', '油墨与纸张模拟为近似演示', '专色批分色使用与叠印预览一致的RGB透射率相乘模型，非光谱打样', '合成素材不是实际印机测量', '目前套准仅支持平移、人工仿射与四角平面校正']})
 
     @app.get('/api/jobs')
     def jobs_list():
@@ -249,6 +249,46 @@ def create_app(data_root=None):
         with processing_lock:
             data = store.export_archive(job_id, include_arrays=request.args.get('arrays') == '1')
         return output_file(data, 'application/zip', job_id + '-printlab.zip')
+
+    @app.post('/api/jobs/<job_id>/spot-batches')
+    def spot_batch_create(job_id):
+        if not processing_lock.acquire(blocking=False):
+            return response({'error': '当前有图像正在处理，请等待结果后重试', 'type': 'busy'}, 409)
+        try:
+            result = spotcolor.create_batch(store, job_id, payload())
+        finally:
+            processing_lock.release()
+        return response(result, 201)
+
+    @app.get('/api/jobs/<job_id>/spot-batches')
+    def spot_batch_list(job_id):
+        return response({'batches': store.list_spot_batches(job_id)})
+
+    @app.get('/api/spot-batches/<batch_id>')
+    def spot_batch_get(batch_id):
+        return response(store.get_spot_batch(batch_id))
+
+    @app.post('/api/spot-batches/<batch_id>/confirm')
+    def spot_batch_confirm(batch_id):
+        if not processing_lock.acquire(blocking=False):
+            return response({'error': '当前有图像正在处理，请等待结果后重试', 'type': 'busy'}, 409)
+        try:
+            result = spotcolor.confirm_batch(store, batch_id, payload().get('plan_id'))
+        finally:
+            processing_lock.release()
+        return response(result, 201)
+
+    @app.get('/api/spot-batches/<batch_id>/plans/<plan_id>/preview/<asset_id>')
+    def spot_plan_preview(batch_id, plan_id, asset_id):
+        data = spotcolor.plan_preview_png(store, batch_id, plan_id, asset_id, request.args.get('kind', 'preview'))
+        return Response(data, mimetype='image/png', headers={'Cache-Control': 'private, max-age=3600'})
+
+    @app.get('/api/spot-batches/<batch_id>/usage')
+    def spot_batch_usage(batch_id):
+        rows = spotcolor.usage_rows(store.get_spot_batch(batch_id))
+        if request.args.get('format') == 'csv':
+            return output_file(reports.table_csv(rows), 'text/csv; charset=utf-8', batch_id + '-usage.csv')
+        return response({'rows': rows})
 
     @app.get('/api/jobs/<job_id>/integrity')
     def integrity(job_id):

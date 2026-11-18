@@ -153,7 +153,8 @@ def job_report(store, job_id):
         'profiles': job.get('profiles', []),
         'notes': job.get('notes', []),
         'operations': job.get('operations', []),
-        'limitations': ['合成演示素材均显式标注。', 'RGB近似油墨模型不代替ICC色彩管理或印刷认证。', '默认所有图像操作生成新结果，保留原图和参数。', '几何套准目前仅提供全局平移、人工仿射和四角平面校正。'],
+        'spot_batches': store.list_spot_batches(job_id),
+        'limitations': ['合成演示素材均显式标注。', 'RGB近似油墨模型不代替ICC色彩管理或印刷认证。', '专色批分色使用与叠印预览一致的RGB透射率相乘模型。', '默认所有图像操作生成新结果，保留原图和参数。', '几何套准目前仅提供全局平移、人工仿射和四角平面校正。'],
     }
     return json_safe(report)
 
@@ -211,6 +212,12 @@ def html_report(report):
         pieces.append('</section>')
     pieces.append('<h2>备注</h2>')
     pieces.append(html_table(report['notes']))
+    if report.get('spot_batches'):
+        pieces.append('<h2>专色油墨批</h2>')
+        for batch in report['spot_batches']:
+            pieces.append('<section><h3>' + html.escape(batch['name']) + ' · ' + html.escape(batch['status']) + '</h3>')
+            pieces.append(html_table(batch['plans']))
+            pieces.append('</section>')
     pieces.append('<h2>适用边界</h2><ul>')
     for limitation in report['limitations']:
         pieces.append('<li>' + html.escape(limitation) + '</li>')
