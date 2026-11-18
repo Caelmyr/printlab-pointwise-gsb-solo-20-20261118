@@ -9,7 +9,7 @@ import numpy as np
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from werkzeug.exceptions import HTTPException
 
-from . import measurements, operations, plates, profiles, reports, targets, workflows
+from . import measurements, operations, plates, profiles, reports, screening_workflow, targets, workflows
 from .pixels import MAX_FILE_BYTES, gray_image, integer, json_safe, png_bytes, read_image, tiff_bytes
 from .storage import Store
 
@@ -346,5 +346,87 @@ def create_app(data_root=None):
         if request.args.get('format') == 'csv':
             return output_file(reports.table_csv(rows), 'text/csv; charset=utf-8', profile_id + '.csv')
         return response({'rows': rows})
+
+    # ---- 统计筛查方案（整印张分组、标注、验证、确认与复检） ----
+    @app.post('/api/jobs/<job_id>/screening/plans')
+    def screening_plan_create(job_id):
+        return response(screening_workflow.create_plan(store, job_id, payload()), 201)
+
+    @app.get('/api/jobs/<job_id>/screening/plans')
+    def screening_plan_list(job_id):
+        return response({'plans': store.list_screening_plans(job_id)})
+
+    @app.get('/api/screening/plans/<plan_id>')
+    def screening_plan_get(plan_id):
+        return response(store.get_screening_plan(plan_id))
+
+    @app.patch('/api/screening/plans/<plan_id>')
+    def screening_plan_update(plan_id):
+        return response(screening_workflow.update_plan(store, plan_id, payload()))
+
+    @app.post('/api/screening/plans/<plan_id>/clone')
+    def screening_plan_clone(plan_id):
+        return response(screening_workflow.clone_plan(store, plan_id, payload()), 201)
+
+    @app.post('/api/screening/plans/<plan_id>/validate')
+    def screening_plan_validate(plan_id):
+        with processing_lock:
+            result = screening_workflow.validate(store, plan_id)
+        return response(result, 201)
+
+    @app.post('/api/screening/plans/<plan_id>/confirm')
+    def screening_plan_confirm(plan_id):
+        body = payload()
+        return response(screening_workflow.confirm_plan(store, plan_id, body.get('policy_name')), 201)
+
+    @app.post('/api/screening/plans/<plan_id>/inspect/<asset_id>')
+    def screening_inspect(plan_id, asset_id):
+        body = payload()
+        with processing_lock:
+            result = screening_workflow.inspect_asset(store, plan_id, asset_id, body.get('policy_name'))
+        return response(result, 201)
+
+    @app.get('/api/screening/plans/<plan_id>/runs')
+    def screening_runs(plan_id):
+        return response({'runs': store.list_screening_runs(plan_id)})
+
+    @app.get('/api/screening/runs/<run_id>')
+    def screening_run_get(run_id):
+        return response(store.get_screening_run(run_id))
+
+    @app.get('/api/screening/plans/<plan_id>/evidence/<asset_id>')
+    def screening_evidence(plan_id, asset_id):
+        region_rank = integer(request.args.get('region', 1), '组件编号', 1, 10000)
+        padding = integer(request.args.get('padding', 12), '证据边距', 0, 200)
+        policy_name = request.args.get('policy_name') or None
+        with processing_lock:
+            result = screening_workflow.evidence(store, plan_id, asset_id, region_rank, padding, policy_name)
+        return response(result)
+
+    @app.get('/api/screening/plans/<plan_id>/evidence/<asset_id>/image')
+    def screening_evidence_image(plan_id, asset_id):
+        region_rank = integer(request.args.get('region', 1), '组件编号', 1, 10000)
+        padding = integer(request.args.get('padding', 12), '证据边距', 0, 200)
+        key = request.args.get('key', '候选局部')
+        policy_name = request.args.get('policy_name') or None
+        with processing_lock:
+            array = screening_workflow.evidence_image(store, plan_id, asset_id, region_rank, key, padding, policy_name)
+        return Response(png_bytes(array), mimetype='image/png', headers={'Cache-Control': 'private, max-age=600'})
+
+    @app.get('/api/screening/runs/<run_id>/export')
+    def screening_run_export(run_id):
+        run = store.get_screening_run(run_id)
+        fmt = request.args.get('format', 'json')
+        if fmt == 'csv':
+            return output_file(reports.table_csv(run['payload']['regions']), 'text/csv; charset=utf-8', run_id + '-regions.csv')
+        if fmt != 'json':
+            raise ValueError('筛查记录导出支持 json 或 csv')
+        return response(run['payload'])
+
+    @app.post('/api/jobs/<job_id>/screening/demo-set')
+    def screening_demo_set(job_id):
+        with processing_lock:
+            result = screening_workflow.create_demo_set(store, job_id, payload())
+        return response(result, 201)
 
     return app

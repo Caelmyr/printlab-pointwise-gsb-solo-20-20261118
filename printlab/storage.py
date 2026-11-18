@@ -122,6 +122,21 @@ class Store:
                     job_id TEXT, event TEXT NOT NULL,
                     payload TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS screening_plans (
+                    id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id),
+                    name TEXT NOT NULL, status TEXT NOT NULL,
+                    payload TEXT NOT NULL, envelope_blob TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS screening_plans_job ON screening_plans(job_id, updated_at);
+                CREATE TABLE IF NOT EXISTS screening_runs (
+                    id TEXT PRIMARY KEY, plan_id TEXT NOT NULL REFERENCES screening_plans(id),
+                    job_id TEXT NOT NULL REFERENCES jobs(id),
+                    asset_id TEXT NOT NULL REFERENCES assets(id),
+                    policy_name TEXT NOT NULL, run_status TEXT NOT NULL,
+                    payload TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS screening_runs_plan ON screening_runs(plan_id, created_at);
             ''')
 
     def serialize(self, value):
@@ -468,12 +483,101 @@ class Store:
             integrity = connection.execute('PRAGMA quick_check').fetchone()[0]
         return {'ok': integrity == 'ok', 'jobs': jobs, 'assets': assets, 'operations': operations, 'database': 'sqlite-wal', 'persistent_root': str(self.root)}
 
+    def save_screening_plan(self, job_id, plan, envelope=None):
+        plan_id = plan['id']
+        now = utc_now()
+        envelope_blob = None
+        if envelope is not None:
+            buffer = io.BytesIO()
+            np.savez_compressed(buffer, median=envelope['median'], scale=envelope['scale'],
+                                support=envelope['support'].astype(np.uint16))
+            envelope_blob = self.write_blob(buffer.getvalue(), 'bin')
+        payload = self.serialize(plan)
+        with self.transaction() as connection:
+            self.require_job(connection, job_id)
+            existing = connection.execute('SELECT id FROM screening_plans WHERE id=?', (plan_id,)).fetchone()
+            if existing:
+                connection.execute('UPDATE screening_plans SET name=?,status=?,payload=?,envelope_blob=COALESCE(?,envelope_blob),updated_at=? WHERE id=?',
+                                   (safe_label(plan['name']), plan['status'], payload, envelope_blob, now, plan_id))
+            else:
+                connection.execute('INSERT INTO screening_plans(id,job_id,name,status,payload,envelope_blob,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)',
+                                   (plan_id, job_id, safe_label(plan['name']), plan['status'], payload, envelope_blob, now, now))
+            self.touch(connection, job_id)
+            self.event(connection, job_id, 'screening_plan_saved', {'plan_id': plan_id, 'status': plan['status']})
+        return self.get_screening_plan(plan_id)
+
+    def _screening_row(self, row):
+        result = dict(row)
+        result['payload'] = json.loads(result['payload'])
+        result.pop('envelope_blob', None)
+        result['has_envelope'] = bool(row['envelope_blob'])
+        return result
+
+    def list_screening_plans(self, job_id):
+        with self.connect() as connection:
+            self.require_job(connection, job_id)
+            rows = connection.execute('SELECT id,job_id,name,status,payload,envelope_blob,created_at,updated_at FROM screening_plans WHERE job_id=? ORDER BY updated_at DESC', (job_id,)).fetchall()
+        return [self._screening_row(row) for row in rows]
+
+    def get_screening_plan(self, plan_id):
+        with self.connect() as connection:
+            row = connection.execute('SELECT id,job_id,name,status,payload,envelope_blob,created_at,updated_at FROM screening_plans WHERE id=?', (plan_id,)).fetchone()
+            if row is None:
+                raise KeyError('筛查方案不存在')
+            return self._screening_row(row)
+
+    def load_screening_envelope(self, plan_id):
+        with self.connect() as connection:
+            row = connection.execute('SELECT envelope_blob,job_id FROM screening_plans WHERE id=?', (plan_id,)).fetchone()
+            if row is None:
+                raise KeyError('筛查方案不存在')
+            if not row['envelope_blob']:
+                raise ValueError('该方案尚未建立正常波动包络')
+            data = self.read_blob(row['envelope_blob'])
+        with np.load(io.BytesIO(data), allow_pickle=False) as loaded:
+            return {'median': np.asarray(loaded['median'], dtype=np.float32),
+                    'scale': np.asarray(loaded['scale'], dtype=np.float32),
+                    'support': np.asarray(loaded['support'], dtype=np.uint16)}
+
+    def save_screening_run(self, plan_id, job_id, asset_id, policy_name, run_status, run):
+        run_id = run['id']
+        now = utc_now()
+        with self.transaction() as connection:
+            self.require_job(connection, job_id)
+            connection.execute('INSERT INTO screening_runs(id,plan_id,job_id,asset_id,policy_name,run_status,payload,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                               (run_id, plan_id, job_id, asset_id, policy_name, run_status, self.serialize(run), now))
+            self.touch(connection, job_id)
+            self.event(connection, job_id, 'screening_run_saved', {'run_id': run_id, 'plan_id': plan_id, 'asset_id': asset_id})
+        return self.get_screening_run(run_id)
+
+    def _run_row(self, row):
+        result = dict(row)
+        result['payload'] = json.loads(result['payload'])
+        return result
+
+    def get_screening_run(self, run_id):
+        with self.connect() as connection:
+            row = connection.execute('SELECT * FROM screening_runs WHERE id=?', (run_id,)).fetchone()
+            if row is None:
+                raise KeyError('筛查记录不存在')
+            return self._run_row(row)
+
+    def list_screening_runs(self, plan_id):
+        with self.connect() as connection:
+            rows = connection.execute('SELECT * FROM screening_runs WHERE plan_id=? ORDER BY created_at DESC', (plan_id,)).fetchall()
+        return [self._run_row(row) for row in rows]
+
     def export_manifest(self, job_id):
         job = self.get_job(job_id)
         job['events'] = self.events(job_id, 1000)
+        job['screening_plans'] = self.list_screening_plans(job_id)
+        job['screening_runs'] = []
+        for plan in job['screening_plans']:
+            job['screening_runs'].extend(self.list_screening_runs(plan['id']))
         job['exported_at'] = utc_now()
         job['format'] = 'printlab-job-v1'
-        job['limitations'] = ['RGB数值工作流，不代替ICC印刷认证', 'CMYK模型为教学与小型栅格打样近似', '图像不超过419万像素']
+        job['limitations'] = ['RGB数值工作流，不代替ICC印刷认证', 'CMYK模型为教学与小型栅格打样近似', '图像不超过419万像素',
+                              '筛查方案为整印张统计分流，像素阈值不等于整张合格判定']
         return job
 
     def export_archive(self, job_id, include_arrays=False):
@@ -494,4 +598,8 @@ class Store:
                         archive.writestr('arrays/' + asset['id'] + '.npy', self.read_blob(row['blob']))
             for operation in manifest['operations']:
                 archive.writestr('reports/' + operation['id'] + '.json', self.serialize(operation))
+            for plan in manifest['screening_plans']:
+                archive.writestr('screening/plans/' + plan['id'] + '.json', self.serialize(plan))
+            for run in manifest['screening_runs']:
+                archive.writestr('screening/runs/' + run['id'] + '.json', self.serialize(run))
         return stream.getvalue()
